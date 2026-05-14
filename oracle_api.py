@@ -447,20 +447,160 @@ def get_price_history(token):
 
 @app.route("/api/bets/live", methods=["GET"])
 def get_live_bets():
-    rng = np.random.default_rng()
-    sample = []
-    for i in range(1, 6):
-        wallet_bytes = rng.bytes(20).hex()
-        sample.append({
-            "id": i,
-            "wallet": f"0x{wallet_bytes[:6]}...{wallet_bytes[-4:]}",
-            "direction": "up" if rng.random() > 0.5 else "down",
-            "amount": round(float(rng.random()) * 2, 4),
-            "token": "ETH",
-            "status": "live",
-            "time_remaining": f"{rng.integers(1, 6)}:{rng.integers(10, 59)}",
-        })
-    return jsonify(sample)
+    """Read real bets from the deployed contract.
+
+    The contract exposes:
+      - getPendingBets() → uint256[] of bet IDs in OPEN/MATCHED status
+      - getBet(uint256)  → full Bet struct
+      - betCounter       → next bet ID (for fallback iteration)
+
+    We read pending bets first (fast path), then optionally include recently-
+    settled bets for the "Live" tab. The frontend separates these into
+    Open / Pending / Live tabs by status.
+    """
+    bets = []
+    if get_operator is None:
+        return jsonify({"bets": [], "reason": "operator_module_not_loaded"})
+
+    try:
+        op = get_operator()
+        if not op or not op.contract:
+            return jsonify({"bets": [], "reason": "contract_not_initialized"})
+
+        # The contract address has more functions than the operator's narrow
+        # ABI. We need to attach a wider ABI just for reads.
+        full_abi = [
+            {"inputs":[],"name":"getPendingBets","outputs":[{"type":"uint256[]"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"type":"uint256"}],"name":"getBet","outputs":[{"type":"tuple","components":[
+                {"name":"creator","type":"address"},
+                {"name":"opponent","type":"address"},
+                {"name":"predictionId","type":"bytes32"},
+                {"name":"creatorDirection","type":"bool"},
+                {"name":"amount","type":"uint256"},
+                {"name":"matchedAmount","type":"uint256"},
+                {"name":"timeframe","type":"uint256"},
+                {"name":"createdAt","type":"uint256"},
+                {"name":"expiresAt","type":"uint256"},
+                {"name":"matchedAt","type":"uint256"},
+                {"name":"settlementTime","type":"uint256"},
+                {"name":"status","type":"uint8"},
+                {"name":"creatorWon","type":"bool"},
+            ]}],"stateMutability":"view","type":"function"},
+            {"inputs":[],"name":"betCounter","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"type":"bytes32"}],"name":"getPrediction","outputs":[{"type":"tuple","components":[
+                {"name":"id","type":"bytes32"},
+                {"name":"token","type":"string"},
+                {"name":"startPrice","type":"uint256"},
+                {"name":"endPrice","type":"uint256"},
+                {"name":"timeframe","type":"uint256"},
+                {"name":"startTime","type":"uint256"},
+                {"name":"endTime","type":"uint256"},
+                {"name":"settled","type":"bool"},
+                {"name":"finalDirection","type":"bool"},
+            ]}],"stateMutability":"view","type":"function"},
+        ]
+        read_contract = op.w3.eth.contract(address=op.contract.address, abi=full_abi)
+
+        # 1) Pending bets (Open + Pending tabs)
+        pending_ids = read_contract.functions.getPendingBets().call()
+
+        # 2) Also include the last ~10 settled bets for the Live/Settled tab.
+        try:
+            counter = read_contract.functions.betCounter().call()
+        except Exception:
+            counter = max(pending_ids) if pending_ids else 0
+
+        # Walk back from the counter, dedup with pending_ids, collect up to 10
+        # additional bets that are not pending (i.e. matched/settled/cancelled).
+        extra_ids = []
+        pending_set = set(pending_ids)
+        for i in range(counter, max(0, counter - 30), -1):
+            if i in pending_set:
+                continue
+            extra_ids.append(i)
+            if len(extra_ids) >= 10:
+                break
+
+        all_ids = list(pending_ids) + extra_ids
+        # Map: status enum int -> status string
+        # Contract enum: Pending(0), Matched(1), Settled(2), Cancelled(3), Expired(4)
+        STATUS_MAP = {0: "open", 1: "pending", 2: "live", 3: "cancelled", 4: "expired"}
+
+        # Cache predictions so we don't re-fetch the same one for every bet
+        pred_cache = {}
+
+        for bid in all_ids:
+            try:
+                b = read_contract.functions.getBet(bid).call()
+            except Exception as e:
+                log.warning(f"getBet({bid}) failed: {e}")
+                continue
+            (creator, opponent, prediction_id, creator_dir, amount, matched_amount,
+             timeframe, created_at, expires_at, matched_at, settlement_time,
+             status_int, creator_won) = b
+            if status_int == 0 and amount == 0:
+                continue  # uninitialized slot
+
+            # Map status. The contract's enum 0=Pending in the bet-creator sense
+            # means "still seeking a counterparty" → frontend "open" tab.
+            # Once matched, it's "pending" (awaiting settlement).
+            # Once settled it goes into the "live" tab as a recent settled bet.
+            status_str = STATUS_MAP.get(int(status_int), "open")
+            # Refine: if pending but matched_amount > 0, it's actually matched
+            if status_int == 1:
+                status_str = "pending"
+            # If status_int == 2 (Settled) we surface as "live" (recently active)
+            if status_int == 2:
+                status_str = "live"
+
+            # Fetch the prediction to get the token + start price
+            token = "?"
+            start_price = 0
+            try:
+                pred_key = prediction_id.hex() if hasattr(prediction_id, "hex") else prediction_id
+                if pred_key in pred_cache:
+                    pred = pred_cache[pred_key]
+                else:
+                    pred = read_contract.functions.getPrediction(prediction_id).call()
+                    pred_cache[pred_key] = pred
+                token = pred[1]
+                start_price = pred[2]
+            except Exception as e:
+                log.warning(f"getPrediction failed for bet {bid}: {e}")
+
+            bets.append({
+                "id": int(bid),
+                "betId": int(bid),
+                "player": creator,
+                "address": creator,
+                "opponent": opponent if opponent and opponent != "0x0000000000000000000000000000000000000000" else None,
+                "matchedTo": opponent if opponent and opponent != "0x0000000000000000000000000000000000000000" else None,
+                "predictionId": "0x" + (prediction_id.hex() if hasattr(prediction_id, "hex") else prediction_id),
+                "direction": "up" if creator_dir else "down",
+                "isUp": bool(creator_dir),
+                "token": token,
+                "timeframe": int(timeframe),
+                "timeframeMinutes": int(timeframe),
+                "stake": float(amount) / 1e18,
+                "stakeWei": str(int(amount)),
+                "matchedAmount": float(matched_amount) / 1e18,
+                "startPrice": float(start_price) / 1e8 if start_price else None,
+                "createdAt": int(created_at),
+                "expiresAt": int(expires_at),
+                "matchedAt": int(matched_at) if matched_at else None,
+                "settlementTime": int(settlement_time) if settlement_time else None,
+                "timeRemaining": max(0, int(settlement_time) - int(time.time())) if settlement_time else None,
+                "status": status_str,
+                "creatorWon": bool(creator_won),
+            })
+
+        # Most recent first
+        bets.sort(key=lambda b: b["createdAt"], reverse=True)
+        return jsonify({"bets": bets, "count": len(bets)})
+
+    except Exception as e:
+        log.exception(f"/api/bets/live failed: {e}")
+        return jsonify({"bets": [], "error": str(e)}), 200
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
