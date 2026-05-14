@@ -43,14 +43,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 
 TIMEFRAMES = (5, 15, 30, 60)
 DEFAULT_TOKENS = ("ETH",)
-PRICE_DECIMALS = 8           # store integer price * 1e8 (Chainlink-style)
-PRICE_CACHE_TTL = 8          # seconds
-SETTLEMENT_BUFFER = 30       # seconds past endTime before we attempt settle
+PRICE_DECIMALS = 8
+PRICE_CACHE_TTL = 8
+SETTLEMENT_BUFFER = 30
 MATCHING_WINDOW_SEC = 5 * 60
-RECOVERY_BLOCK_LOOKBACK = 7200   # ~4 hours of Base blocks (2s/block)
+RECOVERY_BLOCK_LOOKBACK = 7200
 BASE_CHAIN_ID = 8453
 
-# Minimal ABI - only the bits the operator uses
 ABI = [
     {"type": "function", "stateMutability": "nonpayable", "name": "createPrediction",
      "inputs": [
@@ -90,10 +89,6 @@ ABI = [
 ]
 
 
-# ============================================================================
-# Operator
-# ============================================================================
-
 class Operator:
     def __init__(self):
         self.contract_address = os.environ.get("CONTRACT_ADDRESS", "").strip()
@@ -110,18 +105,15 @@ class Operator:
         self._price_cache: dict[str, tuple[float, int]] = {}
         self._started = False
 
-        # Per-(token,timeframe) list of {id, endTime, startPrice, settled}
         self.tracked: dict[str, dict[int, list[dict]]] = {
             t: {tf: [] for tf in TIMEFRAMES} for t in self.tokens
         }
 
-        # Status reporting
-        self.last_open_tx: dict[str, str] = {}    # "{token}_{tf}" -> tx hash
+        self.last_open_tx: dict[str, str] = {}
         self.last_settle_tx: dict[str, str] = {}
         self.last_error: Optional[str] = None
         self.tx_count = {"open": 0, "settle": 0, "failed": 0}
 
-        # Web3 setup
         self.w3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs={"timeout": 20}))
         self.account = None
         self.contract = None
@@ -151,22 +143,14 @@ class Operator:
             f"contract={self.contract_address or '(unset)'}"
         )
 
-    # ------------------------------------------------------------------ price
-
     def fetch_price_usd(self, token: str) -> Optional[int]:
-        """Returns price scaled by 10**PRICE_DECIMALS, or None on failure."""
         now = time.time()
         cached = self._price_cache.get(token)
         if cached and (now - cached[0]) < PRICE_CACHE_TTL:
             return cached[1]
 
-        pair = {
-            "ETH": "ETH-USD",
-            "BTC": "BTC-USD",
-            "LINK": "LINK-USD",
-        }.get(token)
+        pair = {"ETH": "ETH-USD", "BTC": "BTC-USD", "LINK": "LINK-USD"}.get(token)
         if not pair:
-            # Placeholder for tokens without a Coinbase pair
             if token == "STATE":
                 price = int(0.0042 * (10 ** PRICE_DECIMALS))
                 self._price_cache[token] = (now, price)
@@ -175,10 +159,7 @@ class Operator:
             return None
 
         try:
-            r = requests.get(
-                f"https://api.coinbase.com/v2/prices/{pair}/spot",
-                timeout=8,
-            )
+            r = requests.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=8)
             r.raise_for_status()
             amount = float(r.json()["data"]["amount"])
             price = int(amount * (10 ** PRICE_DECIMALS))
@@ -188,8 +169,6 @@ class Operator:
             log.error(f"Coinbase price fetch failed for {pair}: {e}")
             self.last_error = f"price_fetch:{token}:{e}"
             return None
-
-    # ------------------------------------------------------------------ tx
 
     def _build_tx_base(self, nonce: int) -> dict:
         latest = self.w3.eth.get_block("latest")
@@ -206,7 +185,6 @@ class Operator:
         }
 
     def _send_tx(self, fn_call, label: str) -> Optional[dict]:
-        """Build, sign, send, and wait for receipt. Returns receipt or None."""
         with self._tx_lock:
             try:
                 nonce = self.w3.eth.get_transaction_count(self.account.address, "pending")
@@ -229,8 +207,6 @@ class Operator:
                 self.last_error = f"{label}:{e}"
                 log.exception(f"[{label}] tx send failed")
                 return None
-
-    # ------------------------------------------------------------------ actions
 
     def open_prediction(self, token: str, timeframe: int) -> Optional[str]:
         if not self.enabled:
@@ -286,17 +262,22 @@ class Operator:
         self.tx_count["settle"] += 1
         return True
 
-    # ------------------------------------------------------------------ ticks
-
     def tick_open(self):
         """Ensure each (token, timeframe) has a current open matching window."""
+        log.info(f"[tick_open] running for tokens={self.tokens}")
         for token in self.tokens:
             for tf in TIMEFRAMES:
-                if self.get_active_prediction(token, tf) is None:
-                    self.open_prediction(token, tf)
+                try:
+                    if self.get_active_prediction(token, tf) is None:
+                        log.info(f"[tick_open] no active for {token}/{tf}min — opening")
+                        self.open_prediction(token, tf)
+                    else:
+                        log.info(f"[tick_open] {token}/{tf}min already has an active window")
+                except Exception as e:
+                    log.exception(f"[tick_open] {token}/{tf}min failed: {e}")
+                    self.last_error = f"tick_open:{token}/{tf}:{e}"
 
     def tick_settle(self):
-        """Settle any tracked prediction whose endTime has passed."""
         now = int(time.time())
         for token in self.tokens:
             for tf in TIMEFRAMES:
@@ -305,16 +286,12 @@ class Operator:
                         continue
                     if now >= entry["endTime"] + SETTLEMENT_BUFFER:
                         self.settle_prediction(token, entry)
-                # Prune: keep last 5 settled + all unsettled
                 lst = self.tracked[token][tf]
                 unsettled = [e for e in lst if not e["settled"]]
                 settled = [e for e in lst if e["settled"]][-5:]
                 self.tracked[token][tf] = unsettled + settled
 
-    # ------------------------------------------------------------------ queries
-
     def get_active_prediction(self, token: str, timeframe: int) -> Optional[dict]:
-        """Most-recent open matching window for (token, timeframe), or None."""
         now = int(time.time())
         entries = self.tracked.get(token, {}).get(timeframe, [])
         for entry in reversed(entries):
@@ -358,10 +335,13 @@ class Operator:
             "last_error": self.last_error,
         }
 
-    # ------------------------------------------------------------------ recovery
-
     def recover_state_from_chain(self):
-        """Scan recent PredictionCreated events to rebuild in-memory state."""
+        """Scan recent PredictionCreated events to rebuild in-memory state.
+
+        Public Base RPC (mainnet.base.org) doesn't support filter-based methods
+        like eth_newFilter (returns -32602 'filter not found'). Use get_logs
+        directly instead — works on every RPC.
+        """
         if not self.contract:
             return
         try:
@@ -369,18 +349,12 @@ class Operator:
             from_block = max(0, latest_block - RECOVERY_BLOCK_LOOKBACK)
             log.info(f"Recovering state from blocks {from_block}..{latest_block}")
 
-            # web3.py v6 syntax: create_filter accepts fromBlock/toBlock kwargs
+            event = self.contract.events.PredictionCreated()
             try:
-                event_filter = self.contract.events.PredictionCreated.create_filter(
-                    fromBlock=from_block, toBlock="latest",
-                )
-                events = event_filter.get_all_entries()
+                events = event.get_logs(from_block=from_block, to_block="latest")
             except TypeError:
-                # web3.py v7 uses from_block/to_block
-                event_filter = self.contract.events.PredictionCreated.create_filter(
-                    from_block=from_block, to_block="latest",
-                )
-                events = event_filter.get_all_entries()
+                # web3.py <6 uses camelCase
+                events = event.get_logs(fromBlock=from_block, toBlock="latest")
 
             count_recovered = 0
             for ev in events:
@@ -391,7 +365,6 @@ class Operator:
                     continue
 
                 pred_id_bytes = args["predictionId"]
-                # Check if already settled on-chain
                 onchain = self.contract.functions.getPrediction(pred_id_bytes).call()
                 settled = onchain[7]
                 end_price = onchain[3]
@@ -406,33 +379,28 @@ class Operator:
                 count_recovered += 1
 
             log.info(f"Recovered {count_recovered} predictions from chain")
+            self.last_error = None
         except Exception as e:
             log.exception(f"Recovery failed: {e}")
             self.last_error = f"recovery:{e}"
-
-    # ------------------------------------------------------------------ lifecycle
 
     def start(self):
         if self._started:
             return
         self._started = True
 
-        # Recover before scheduling so first tick doesn't double-up
         self.recover_state_from_chain()
 
         self.scheduler = BackgroundScheduler(
             timezone="UTC",
             job_defaults={"coalesce": True, "misfire_grace_time": 300},
         )
-        # Open new windows every 5 min on the dot. Fire ~5s after the minute
-        # so blocks have settled and we don't race with the previous tick.
         self.scheduler.add_job(
             self.tick_open,
             "cron", minute="*/5", second=10,
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
             id="tick_open",
         )
-        # Settle every minute (cheap operation that's mostly a no-op)
         self.scheduler.add_job(
             self.tick_settle,
             "interval", minutes=1,
@@ -442,10 +410,6 @@ class Operator:
         self.scheduler.start()
         log.info("Scheduler started")
 
-
-# ============================================================================
-# Singleton
-# ============================================================================
 
 _operator: Optional[Operator] = None
 _init_lock = threading.Lock()

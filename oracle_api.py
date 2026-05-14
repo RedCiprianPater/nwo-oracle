@@ -572,10 +572,49 @@ def operator_status():
         base["last_settle_tx"] = st.get("last_settle_tx")
         base["last_error"] = st.get("last_error")
         base["active_windows"] = st.get("active")
+        # Surface whether APScheduler thread is alive — gunicorn forks can
+        # leave the scheduler dead in the worker serving this request.
+        sched = getattr(op, "scheduler", None)
+        if sched is not None:
+            try:
+                base["scheduler_jobs"] = [
+                    {"id": j.id, "next_run": str(j.next_run_time)} for j in sched.get_jobs()
+                ]
+                base["scheduler_running"] = sched.running
+            except Exception:
+                base["scheduler_running"] = False
     except Exception as e:
         log.exception("operator status failed: %s", e)
         base["error"] = str(e)
     return jsonify(base)
+
+
+@app.route("/api/operator_tick_open", methods=["POST", "GET"])
+def operator_tick_open():
+    """Manually fire tick_open() once. Diagnostic for scheduler issues.
+    Gated by ?key=… matching env var OPERATOR_ADMIN_KEY (if set)."""
+    admin_key = os.environ.get("OPERATOR_ADMIN_KEY", "").strip()
+    if admin_key:
+        provided = request.args.get("key") or (request.get_json(silent=True) or {}).get("key", "")
+        if provided != admin_key:
+            return jsonify({"error": "unauthorized"}), 401
+    if get_operator is None:
+        return jsonify({"error": "operator_module_not_imported"}), 500
+    try:
+        op = get_operator()
+        before = dict(op.tx_count)
+        op.tick_open()
+        after = dict(op.tx_count)
+        return jsonify({
+            "ok": True,
+            "tx_count_before": before,
+            "tx_count_after": after,
+            "last_open_tx": op.last_open_tx,
+            "last_error": op.last_error,
+        })
+    except Exception as e:
+        log.exception("manual tick_open failed: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 def _humanize_secs(s: int) -> str:
     if s < 60: return f"{s}s"
