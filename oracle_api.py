@@ -495,18 +495,21 @@ def _operator_timeframes():
 
 @app.route("/api/active_prediction/<token>/<int:timeframe>", methods=["GET"])
 def active_prediction(token, timeframe):
+    # NOTE: We return 200 with {active:false, ...} for "no open window" rather
+    # than 404. 404 should mean "endpoint doesn't exist" — and clients can't
+    # tell those apart. The frontend gates the Place Bet button on `active`.
     if get_operator is None:
         return jsonify({
-            "active": False, "reason": "operator_unavailable",
+            "active": False, "open": False, "reason": "operator_unavailable",
             "token": token.upper(), "timeframe": timeframe,
-        }), 404
+        }), 200
     op = get_operator()
     p = op.get_active_prediction(token.upper(), int(timeframe))
     if not p:
         return jsonify({
-            "active": False, "reason": "no_open_window",
+            "active": False, "open": False, "reason": "no_open_window",
             "token": token.upper(), "timeframe": timeframe,
-        }), 404
+        }), 200
     return jsonify({
         "active": True,
         "prediction_id": p["id"],
