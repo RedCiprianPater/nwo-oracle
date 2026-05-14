@@ -495,31 +495,46 @@ def _operator_timeframes():
 
 @app.route("/api/active_prediction/<token>/<int:timeframe>", methods=["GET"])
 def active_prediction(token, timeframe):
-    # NOTE: We return 200 with {active:false, ...} for "no open window" rather
-    # than 404. 404 should mean "endpoint doesn't exist" — and clients can't
-    # tell those apart. The frontend gates the Place Bet button on `active`.
+    # We return 200 with {active:false, ...} for "no open window" rather than
+    # 404. 404 should mean "endpoint doesn't exist" — and clients can't tell
+    # those apart. The frontend gates the Place Bet button on `active`.
+    base = {
+        "token": token.upper(),
+        "timeframe": int(timeframe),
+        "active": False,
+        "open": False,
+    }
     if get_operator is None:
-        return jsonify({
-            "active": False, "open": False, "reason": "operator_unavailable",
-            "token": token.upper(), "timeframe": timeframe,
-        }), 200
-    op = get_operator()
+        return jsonify({**base, "reason": "operator_unavailable"}), 200
+
+    try:
+        op = get_operator()
+    except Exception as e:
+        return jsonify({**base, "reason": f"operator_error:{e}"}), 200
+
     p = op.get_active_prediction(token.upper(), int(timeframe))
     if not p:
-        return jsonify({
-            "active": False, "open": False, "reason": "no_open_window",
-            "token": token.upper(), "timeframe": timeframe,
-        }), 200
+        return jsonify({**base, "reason": "no_open_window"}), 200
+
+    # `p` is the operator's tracked dict, shape:
+    #   {id, endTime, startPrice, settled, startTime, matchingCloseAt, timeframe, token}
+    # Translate to the shape the frontend expects.
+    now = int(time.time())
+    matching_remaining = max(0, int(p.get("matchingCloseAt", 0)) - now)
+    settle_remaining   = max(0, int(p.get("endTime", 0))         - now)
+
     return jsonify({
+        **base,
         "active": True,
-        "prediction_id": p["id"],
-        "token": p["token"],
-        "timeframe": p["timeframe"],
-        "start_price": p["startPrice"],
-        "start_time": p["startTime"],
-        "matching_close_at": p["matchingCloseAt"],
-        "end_time": p["endTime"],
-    })
+        "open": matching_remaining > 0,
+        "prediction_id": p.get("id"),
+        "start_price": p.get("startPrice"),
+        "start_time": p.get("startTime"),
+        "end_time": p.get("endTime"),
+        "matching_close_at": p.get("matchingCloseAt"),
+        "matching_window_remaining": matching_remaining,
+        "settle_remaining": settle_remaining,
+    }), 200
 
 @app.route("/api/operator_status", methods=["GET"])
 def operator_status():
@@ -537,12 +552,26 @@ def operator_status():
         },
     }
     if get_operator is None:
-        return jsonify(base)
+        return jsonify({**base, "reason": "operator_module_not_imported"})
     try:
         op = get_operator()
         st = op.status() if op else {}
-        base.update(st)
-        base["running"] = bool(st.get("running", True))
+        # Your operator.status() returns {enabled, contract, operator_address,
+        # tokens, active, tx_count, last_open_tx, last_settle_tx, last_error}.
+        # `enabled=False` means dry-run — operator is alive but won't send tx.
+        # The scheduler is "running" if the operator object exists; "enabled"
+        # is what actually matters for windows to appear on-chain.
+        base["running"] = True  # the python process / scheduler is alive
+        base["enabled"] = bool(st.get("enabled", False))
+        base["mode"] = "live" if st.get("enabled") else "dry_run"
+        base["operator_address"] = st.get("operator_address")
+        base["contract"] = st.get("contract")
+        base["tokens"] = st.get("tokens") or base["tokens"]
+        base["tx_count"] = st.get("tx_count")
+        base["last_open_tx"] = st.get("last_open_tx")
+        base["last_settle_tx"] = st.get("last_settle_tx")
+        base["last_error"] = st.get("last_error")
+        base["active_windows"] = st.get("active")
     except Exception as e:
         log.exception("operator status failed: %s", e)
         base["error"] = str(e)
