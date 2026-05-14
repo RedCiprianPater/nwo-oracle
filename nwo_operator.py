@@ -96,12 +96,21 @@ class Operator:
         self.rpc_url = os.environ.get("RPC_URL", "https://mainnet.base.org").strip()
         self.enabled = os.environ.get("OPERATOR_ENABLED", "false").lower() == "true"
         self.gas_limit = int(os.environ.get("OPERATOR_GAS_LIMIT", "500000"))
-        self.priority_gwei = float(os.environ.get("OPERATOR_PRIORITY_GWEI", "0.005"))
+        # NOTE: default priority bumped from 0.005 -> 0.05 gwei. Base accepts very
+        # low gas but at ~0.005 gwei tx can sit pending for many minutes, causing
+        # nonce collisions when the next tick fires. 0.05 gwei is still a fraction
+        # of a cent per tx but gets included in the next block reliably.
+        self.priority_gwei = float(os.environ.get("OPERATOR_PRIORITY_GWEI", "0.05"))
         tokens_env = os.environ.get("OPERATOR_TOKENS", "ETH").strip()
         self.tokens = tuple(t.strip().upper() for t in tokens_env.split(",") if t.strip())
 
         self.scheduler: Optional[BackgroundScheduler] = None
         self._tx_lock = threading.Lock()
+        # Local nonce cache. We increment this for every tx we submit and only
+        # refresh from chain when we hit a nonce error. Without this, submitting
+        # 12 tx in a tight loop all read the same pending nonce and only the
+        # first wins — the rest fail with "replacement transaction underpriced".
+        self._next_nonce: Optional[int] = None
         self._price_cache: dict[str, tuple[float, int]] = {}
         self._started = False
 
@@ -184,29 +193,63 @@ class Operator:
             "chainId": BASE_CHAIN_ID,
         }
 
+    def _refresh_nonce(self) -> int:
+        """Read the current nonce from chain and reset our local counter."""
+        n = self.w3.eth.get_transaction_count(self.account.address, "pending")
+        self._next_nonce = n
+        return n
+
     def _send_tx(self, fn_call, label: str) -> Optional[dict]:
+        """Build, sign, send, and wait for receipt. Returns receipt or None.
+
+        Uses a local nonce counter so back-to-back submissions in the same
+        tick get sequential nonces. If the chain disagrees with our cached
+        value (anyone else used this address, or a tx dropped), we retry
+        once with a fresh value from chain.
+        """
         with self._tx_lock:
-            try:
-                nonce = self.w3.eth.get_transaction_count(self.account.address, "pending")
-                tx = fn_call.build_transaction(self._build_tx_base(nonce))
-                signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
-                raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-                tx_hash = self.w3.eth.send_raw_transaction(raw)
-                tx_hex = tx_hash.hex()
-                log.info(f"[{label}] tx submitted: {tx_hex}")
-                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-                if receipt.status != 1:
+            for attempt in range(2):
+                try:
+                    if self._next_nonce is None:
+                        nonce = self._refresh_nonce()
+                    else:
+                        nonce = self._next_nonce
+
+                    tx = fn_call.build_transaction(self._build_tx_base(nonce))
+                    signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
+                    raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+                    tx_hash = self.w3.eth.send_raw_transaction(raw)
+                    tx_hex = tx_hash.hex()
+                    # Successfully submitted — bump local nonce for the next tx
+                    self._next_nonce = nonce + 1
+                    log.info(f"[{label}] tx submitted (nonce={nonce}): {tx_hex}")
+                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                    if receipt.status != 1:
+                        self.tx_count["failed"] += 1
+                        self.last_error = f"{label}:reverted:{tx_hex}"
+                        log.error(f"[{label}] reverted: {tx_hex}")
+                        return None
+                    log.info(f"[{label}] confirmed in block {receipt.blockNumber}")
+                    return dict(receipt)
+                except Exception as e:
+                    msg = str(e).lower()
+                    # Nonce drift — refresh from chain and retry once.
+                    if attempt == 0 and (
+                        "nonce" in msg
+                        or "underpriced" in msg
+                        or "already known" in msg
+                    ):
+                        log.warning(f"[{label}] nonce issue ({e}); refreshing and retrying")
+                        try:
+                            self._refresh_nonce()
+                        except Exception:
+                            pass
+                        continue
                     self.tx_count["failed"] += 1
-                    self.last_error = f"{label}:reverted:{tx_hex}"
-                    log.error(f"[{label}] reverted: {tx_hex}")
+                    self.last_error = f"{label}:{e}"
+                    log.exception(f"[{label}] tx send failed")
                     return None
-                log.info(f"[{label}] confirmed in block {receipt.blockNumber}")
-                return dict(receipt)
-            except Exception as e:
-                self.tx_count["failed"] += 1
-                self.last_error = f"{label}:{e}"
-                log.exception(f"[{label}] tx send failed")
-                return None
+        return None
 
     def open_prediction(self, token: str, timeframe: int) -> Optional[str]:
         if not self.enabled:
