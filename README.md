@@ -1,37 +1,135 @@
-# NWO Oracle — API
+# NWO Oracle — API + Operator
 
-Backend service for the [NWO Oracle](https://huggingface.co/spaces/CPater/nwo-oracle)
-P2P prediction-betting platform on Base Mainnet. Serves price history, AI consensus
-predictions (TimesFM / EML / Kronos stubs), and live-bet samples to the static
-frontend.
+Backend service for [NWO Oracle](https://huggingface.co/spaces/CPater/nwo-oracle).
+Two things in one Render service:
+
+1. **HTTP API** (Flask) — price history, AI consensus predictions, live-bet samples
+2. **Operator loop** (APScheduler) — keeps the on-chain prediction lifecycle running
+   (`createPrediction` every 5 minutes, `settlePrediction` as windows close)
 
 ## Live deployment
 
 - **Frontend (HF Space):** https://huggingface.co/spaces/CPater/nwo-oracle
-- **Smart contract (Base Mainnet, verified):**
+- **Smart contract (verified, Base Mainnet):**
   [`0x16F2E8003877A8Bdb06dB01c30C7eD236285a035`](https://basescan.org/address/0x16F2E8003877A8Bdb06dB01c30C7eD236285a035)
-- **API:** deployed on Render (URL set in the frontend `CONFIG` block)
+- **API:** https://nwo-oracles.onrender.com
 
-## Endpoints
+## HTTP endpoints
 
-| Method | Path                              | Purpose                                   |
-| ------ | --------------------------------- | ----------------------------------------- |
-| GET    | `/health`                         | Liveness probe — returns `{status: "ok"}` |
-| GET    | `/`                               | List of available endpoints               |
-| GET    | `/api/stats`                      | Platform stats (volume, bets, accuracy)   |
-| GET    | `/api/history/<token>`            | 200 candles of OHLCV (synthesised)        |
-| GET    | `/api/bets/live`                  | Sample live bets (demo)                   |
-| POST   | `/api/predict`                    | Consensus prediction from 3 models        |
-| GET    | `/api/predictions/<prediction_id>`| Fetch a previously generated prediction   |
+| Method | Path                                              | Purpose                                |
+| ------ | ------------------------------------------------- | -------------------------------------- |
+| GET    | `/health`                                         | Liveness probe                         |
+| GET    | `/`                                               | List endpoints                         |
+| GET    | `/api/stats`                                      | Platform stats (volume, bets)          |
+| GET    | `/api/history/<token>`                            | 200 OHLCV candles                      |
+| GET    | `/api/bets/live`                                  | Sample live bets                       |
+| POST   | `/api/predict`                                    | Consensus from TimesFM / EML / Kronos  |
+| GET    | `/api/predictions/<id>`                           | Re-fetch a previous prediction         |
+| GET    | `/api/active_prediction/<token>/<timeframe>`      | Current open matching window (NEW)     |
+| GET    | `/api/operator_status`                            | Operator scheduler state (NEW)         |
 
-`/api/predict` request body:
+The frontend calls `/api/active_prediction/ETH/5` (or 15/30/60) right before
+submitting a bet, so the bet targets a real on-chain prediction window.
 
-```json
-{ "token": "ETH", "horizon": 20, "price_history": [3247.5, 3250.1, ...] }
+## Operator: what it does
+
+The smart contract requires the owner to:
+
+1. Call `createPrediction(token, startPrice, timeframe)` to open a 5-min matching
+   window, after which bets settle at `startTime + timeframe minutes`.
+2. Call `settlePrediction(predictionId, endPrice)` after the window ends.
+
+This service does both automatically. On a 5-minute cron, it checks each
+`(token, timeframe)` pair — if there's no open matching window, it opens a new
+one. Every minute, it settles any prediction whose window has ended (with a
+30-second buffer).
+
+Price source: **Coinbase spot prices** (`api.coinbase.com/v2/prices/<pair>/spot`).
+Free, no auth, generous rate limit. Prices cached for 8 seconds.
+
+State recovery: on startup, the operator scans the last ~4 hours of
+`PredictionCreated` events from the contract and rebuilds its in-memory state.
+This handles Render free-tier idle restarts gracefully.
+
+## Environment variables
+
+Set these in the Render dashboard under **Environment** → **Add Environment
+Variable**. None of them go in git. The `.env.example` file documents them
+without secrets.
+
+| Variable                 | Required | Default                       | Description                          |
+| ------------------------ | -------- | ----------------------------- | ------------------------------------ |
+| `CONTRACT_ADDRESS`       | ✅       | —                             | `0x16F2E8003877A8Bdb06dB01c30C7eD236285a035` |
+| `OWNER_PRIVATE_KEY`      | ✅       | —                             | Private key of contract owner wallet |
+| `OPERATOR_ENABLED`       | ✅       | `false`                       | `true` to send tx; `false` = dry run |
+| `RPC_URL`                |          | `https://mainnet.base.org`    | Base RPC endpoint                    |
+| `OPERATOR_TOKENS`        |          | `ETH`                         | Comma-separated (`ETH,BTC`)          |
+| `OPERATOR_GAS_LIMIT`     |          | `500000`                      | Per-tx gas limit                     |
+| `OPERATOR_PRIORITY_GWEI` |          | `0.005`                       | Priority fee (gwei)                  |
+
+**`OPERATOR_ENABLED=false` is the default** so the operator never accidentally
+sends transactions on first deploy. Flip it to `true` only after confirming
+`/api/operator_status` looks correct.
+
+### Operator wallet hygiene
+
+The operator wallet (`OWNER_PRIVATE_KEY`) signs `createPrediction` and
+`settlePrediction` calls. It does **not** hold any user funds — those live in
+the contract. But it does have admin rights (pause, change fee recipient,
+emergency refund), so:
+
+- **Use a dedicated wallet**, not your main one. Funding ~0.005 ETH on Base lasts
+  many months at current gas.
+- **Never commit the key**, never share it, never put it in this repo's git
+  history. Set it as a Render environment variable.
+- **For added safety**, transfer contract ownership to a Safe (multisig) once
+  things are stable; the operator can still call `createPrediction`/
+  `settlePrediction` if you make those non-owner-only later, or you keep them
+  owner-only and route through the Safe.
+
+## Deploy on Render
+
+1. Push this repo to GitHub.
+2. Render dashboard → **New +** → **Web Service** → connect this repo.
+3. Settings:
+   - Runtime: **Python 3**
+   - Build command: `pip install -r requirements.txt`
+   - Start command: blank (the `Procfile` runs gunicorn with `--workers 1` —
+     important so the scheduler doesn't double-fire).
+   - Instance type: **Free** (cold-starts after 15min idle) or **Starter** for
+     always-warm.
+4. Add the env vars above. Set `OPERATOR_ENABLED=false` first.
+5. Deploy. Tail the logs in the Render dashboard.
+6. Once the service is up: `curl https://nwo-oracles.onrender.com/health`
+7. Check the operator state: `curl https://nwo-oracles.onrender.com/api/operator_status`
+   — should show `enabled: false`, `tokens: ["ETH"]`, empty `active`.
+8. Flip `OPERATOR_ENABLED=true` in the Render env vars. Redeploy.
+9. Within ~30 seconds the operator will open its first window. Verify with:
+   ```
+   curl https://nwo-oracles.onrender.com/api/active_prediction/ETH/5
+   ```
+   Should return `active: true` and a `prediction_id`.
+
+## Gas estimate
+
+Each cron tick opens up to 4 predictions (one per timeframe) and settles
+whatever's due. Roughly **8 transactions per 5 minutes** when everything's
+working, so ~100/hour. At Base gas (currently ~0.005 gwei), that's a fraction
+of a cent per hour. **0.005 ETH funding lasts months.** Keep an eye on the
+operator wallet's balance and top up when it drops below 0.001 ETH.
+
+## Operator API
+
+```bash
+# Status: see what the operator is doing right now
+curl https://nwo-oracles.onrender.com/api/operator_status | jq
+
+# Active prediction for ETH 5-min — frontend hits this before each bet
+curl https://nwo-oracles.onrender.com/api/active_prediction/ETH/5 | jq
+
+# When no window is open (e.g. just woke from Render idle)
+# Returns HTTP 404 with {active: false, reason: "no_open_window"}
 ```
-
-All fields optional. If `price_history` is omitted, the API synthesises a series
-for the requested token; replace with real exchange data in production.
 
 ## Local development
 
@@ -40,83 +138,34 @@ git clone https://github.com/RedCiprianPater/nwo-oracle.git
 cd nwo-oracle
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python oracle_api.py          # http://localhost:5000
-curl http://localhost:5000/health
+
+# Run in dry-run mode (no tx sent, but everything else works)
+export CONTRACT_ADDRESS=0x16F2E8003877A8Bdb06dB01c30C7eD236285a035
+export OPERATOR_ENABLED=false
+python oracle_api.py     # http://localhost:5000
 ```
 
-## Deploy to Render
-
-1. Push this repo to GitHub.
-2. On Render: **New +** → **Web Service** → connect this repo.
-3. Settings:
-   - Runtime: **Python 3**
-   - Build command: `pip install -r requirements.txt`
-   - Start command: leave blank (the `Procfile` handles it)
-   - Instance type: **Free** (cold-starts after 15 min idle) or **Starter** ($7/mo, always warm)
-4. Deploy. Wait for the build to finish.
-5. Test: `curl https://YOUR-SERVICE.onrender.com/health` should return JSON.
-6. Set the same URL in the HF Space's `index.html` `CONFIG.API_BASE` value
-   and push to the space repo.
-
-## Architecture
-
-```
-            ┌─────────────────────────────┐
-   browser  │  HF Static Space (frontend) │
-            │  • index.html               │
-            │  • MetaMask + ethers.js     │
-            └────────┬───────────┬────────┘
-                     │           │
-                     │           │ (read/write contract calls)
-                     │           ▼
-                     │  ┌─────────────────────┐
-                     │  │  Base Mainnet       │
-                     │  │  NWOOracleP2PBase   │
-                     │  └─────────────────────┘
-                     │
-                     │ (fetch predictions, prices, stats)
-                     ▼
-            ┌──────────────────────────────┐
-            │  Render (this service)       │
-            │  • Flask + gunicorn          │
-            │  • Predictor stubs           │
-            └──────────────────────────────┘
-```
-
-The frontend talks to **both** the contract (for bets) and the API (for
-predictions/charts) independently. If the API is unreachable the frontend
-falls back to demo data and shows a "demo" badge — bets against the contract
-still work.
+The dry-run mode prints what it *would* do without sending transactions —
+useful for testing.
 
 ## Swapping in real models
 
-The `TimesFMPredictor` / `EMLPredictor` / `KronosPredictor` classes in
-`oracle_api.py` are stubs that match the eventual model signatures. Replace
-the `predict()` body in each with real inference and add the relevant deps to
-`requirements.txt`. The output schema is fixed so the frontend doesn't need
-changes:
+`TimesFMPredictor` / `EMLPredictor` / `KronosPredictor` in `oracle_api.py` are
+stubs that match the eventual model signatures. Replace each `predict()` body
+with real inference, add deps to `requirements.txt`, and the frontend won't
+need changes — the response schema is fixed.
 
-```python
-return {
-    "target_price": float,      # in USD
-    "direction": "up" | "down",
-    "confidence": float,        # 0-100
-    "model": str,
-}
+## File map
+
 ```
-
-## Operator role (not yet implemented here)
-
-The contract requires the owner to call `createPrediction(token, startPrice,
-timeframe)` to open each betting window and `settlePrediction(predictionId,
-endPrice)` after the window closes. This loop is **not yet** part of this
-service — bets won't actually settle until you wire that up. Options:
-
-- Add a scheduled job to this same Render service (APScheduler, every 5 min)
-- Run a separate Cloudflare Worker / GitHub Action on a cron
-- Run it locally and push the keys to a server later
-
-If you want a starting point for that operator loop, ask and I'll add it.
+oracle_api.py        Flask app, HTTP endpoints
+nwo_operator.py      Scheduler, contract interaction, state recovery
+requirements.txt     Python deps
+Procfile             gunicorn config (workers=1 is intentional)
+runtime.txt          Python version pin for Render
+.env.example         Documents env vars (no secrets, safe to commit)
+.gitignore           Standard Python ignores
+```
 
 ## License
 

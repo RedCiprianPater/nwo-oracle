@@ -2,3 +2,7 @@ flask==3.0.3
 flask-cors==4.0.1
 numpy==1.26.4
 gunicorn==21.2.0
+web3==6.20.3
+eth-account==0.11.3
+apscheduler==3.10.4
+requests==2.32.3

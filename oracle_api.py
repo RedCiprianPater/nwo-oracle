@@ -2,39 +2,41 @@
 NWO Oracle API - Render deployment
 
 Endpoints:
-  GET  /health                          -> liveness probe
-  GET  /api/stats                       -> platform stats
-  GET  /api/history/<token>             -> 200 candles of OHLCV (mocked)
-  GET  /api/bets/live                   -> sample live bets
-  POST /api/predict                     -> consensus prediction from 3 models
-  GET  /api/predictions/<prediction_id> -> fetch a previous prediction
+  GET  /health                                 -> liveness probe
+  GET  /api/stats                              -> platform stats
+  GET  /api/history/<token>                    -> 200 candles of OHLCV (mock)
+  GET  /api/bets/live                          -> sample live bets (demo)
+  POST /api/predict                            -> consensus prediction from 3 models
+  GET  /api/predictions/<prediction_id>        -> fetch a previous prediction
+  GET  /api/active_prediction/<tok>/<tf>       -> current open prediction window
+  GET  /api/operator_status                    -> operator scheduler status
 
-Replace the *Predictor classes with real model inference when ready.
+The operator (nwo_operator.py) starts automatically on first request and
+maintains the on-chain prediction lifecycle. See README.md for env vars.
 """
 
+import logging
 import os
-import numpy as np
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+
+import numpy as np
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+from nwo_operator import get_operator
+
+log = logging.getLogger("nwo.api")
+logging.basicConfig(level=logging.INFO)
+
 app = Flask(__name__)
-
-# CORS: allow your HF space + local dev. Tighten this in production.
-ALLOWED_ORIGINS = [
-    "https://cpater-nwo-oracle.hf.space",
-    "https://huggingface.co",
-    "http://localhost:3000",
-    "http://localhost:8080",
-    "http://127.0.0.1:5500",
-]
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS + ["*"]}})  # permissive for now
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 
-# ----------------------------- Predictors -----------------------------
+# ============================================================================
+# Predictor stubs (swap for real models later)
+# ============================================================================
 
 class TimesFMPredictor:
-    """Time Series Foundation Model stub. Swap in real TimesFM weights later."""
     def predict(self, price_history, horizon=20):
         if len(price_history) < 10:
             return None
@@ -51,7 +53,6 @@ class TimesFMPredictor:
 
 
 class EMLPredictor:
-    """Evolutionary ML Trees stub."""
     def predict(self, price_history, horizon=20):
         if len(price_history) < 20:
             return None
@@ -70,14 +71,13 @@ class EMLPredictor:
 
 
 class KronosPredictor:
-    """Kronos candlestick foundation-model stub."""
     def predict(self, ohlcv, horizon=20):
         if len(ohlcv) < 50:
             return None
         closes = np.array([d["close"] for d in ohlcv[-50:]], dtype=float)
         vols = np.array([d["volume"] for d in ohlcv[-50:]], dtype=float)
         diffs = np.diff(closes[-20:])
-        weights = vols[-20:][1:]  # align to diffs
+        weights = vols[-20:][1:]
         if weights.sum() == 0:
             weights = np.ones_like(weights)
         vw_trend = float(np.average(diffs, weights=weights))
@@ -94,12 +94,12 @@ class KronosPredictor:
 timesfm = TimesFMPredictor()
 eml = EMLPredictor()
 kronos = KronosPredictor()
-
-# In-memory cache of recent predictions (cleared on restart - fine for v1)
 active_predictions = {}
 
 
-# ----------------------------- Helpers -----------------------------
+# ============================================================================
+# Helpers
+# ============================================================================
 
 def _base_price_for(token: str) -> float:
     return {"ETH": 3400.0, "BTC": 67000.0, "STATE": 0.0042, "LINK": 18.45}.get(
@@ -115,11 +115,17 @@ def _synth_history(token: str, n: int = 200):
     return prices.tolist()
 
 
-# ----------------------------- Routes ------------------------------
+# ============================================================================
+# Routes
+# ============================================================================
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "nwo-oracle-api", "time": datetime.utcnow().isoformat()})
+    return jsonify({
+        "status": "ok",
+        "service": "nwo-oracle-api",
+        "time": datetime.utcnow().isoformat(),
+    })
 
 
 @app.route("/", methods=["GET"])
@@ -127,12 +133,14 @@ def root():
     return jsonify({
         "service": "NWO Oracle API",
         "endpoints": [
-            "/health",
-            "/api/stats",
-            "/api/history/<token>",
-            "/api/bets/live",
-            "/api/predict (POST)",
-            "/api/predictions/<id>",
+            "GET  /health",
+            "GET  /api/stats",
+            "GET  /api/history/<token>",
+            "GET  /api/bets/live",
+            "POST /api/predict",
+            "GET  /api/predictions/<id>",
+            "GET  /api/active_prediction/<token>/<timeframe>",
+            "GET  /api/operator_status",
         ],
     })
 
@@ -159,12 +167,11 @@ def get_prediction():
     avg_target = float(np.mean([p["target_price"] for p in preds]))
 
     prediction_id = f"{token}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
-
     result = {
         "prediction_id": prediction_id,
         "token": token,
         "current_price": float(price_history[-1]),
-        "window_duration": 399,  # seconds, ~6.66 min
+        "window_duration": 399,
         "predictions": {
             "timesfm": timesfm_pred,
             "eml": eml_pred,
@@ -180,12 +187,10 @@ def get_prediction():
         "expires_at": (datetime.utcnow() + timedelta(seconds=399)).isoformat(),
     }
     active_predictions[prediction_id] = result
-    # Bound memory
     if len(active_predictions) > 500:
         oldest = sorted(active_predictions.keys())[:100]
         for k in oldest:
             active_predictions.pop(k, None)
-
     return jsonify(result)
 
 
@@ -213,10 +218,7 @@ def get_price_history(token):
         low = min(open_p, close) - abs(rng.normal(0, base * 0.002))
         history.append({
             "time": (now - timedelta(minutes=200 - i)).isoformat(),
-            "open": open_p,
-            "high": high,
-            "low": low,
-            "close": close,
+            "open": open_p, "high": high, "low": low, "close": close,
             "volume": float(1_000_000 + rng.integers(-100_000, 100_000)),
         })
         price = close
@@ -225,7 +227,6 @@ def get_price_history(token):
 
 @app.route("/api/bets/live", methods=["GET"])
 def get_live_bets():
-    # Demo data; replace with on-chain reads from the contract later
     rng = np.random.default_rng()
     sample = []
     for i in range(1, 6):
@@ -244,7 +245,6 @@ def get_live_bets():
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
-    # Demo data; aggregate from contract events in production
     return jsonify({
         "total_volume": 2_100_000,
         "total_bets": 2_456,
@@ -255,7 +255,46 @@ def get_stats():
     })
 
 
+# -- Operator endpoints ------------------------------------------------------
+
+@app.route("/api/active_prediction/<token>/<int:timeframe>", methods=["GET"])
+def active_prediction(token, timeframe):
+    """Returns the current open matching window the frontend should bet against."""
+    op = get_operator()
+    p = op.get_active_prediction(token.upper(), int(timeframe))
+    if not p:
+        return jsonify({
+            "active": False,
+            "reason": "no_open_window",
+            "token": token.upper(),
+            "timeframe": timeframe,
+        }), 404
+    return jsonify({
+        "active": True,
+        "prediction_id": p["id"],
+        "token": p["token"],
+        "timeframe": p["timeframe"],
+        "start_price": p["startPrice"],
+        "start_time": p["startTime"],
+        "matching_close_at": p["matchingCloseAt"],
+        "end_time": p["endTime"],
+    })
+
+
+@app.route("/api/operator_status", methods=["GET"])
+def operator_status():
+    op = get_operator()
+    return jsonify(op.status())
+
+
+# Start operator on import so it's running by the time the first request lands.
+# Wrapped in try/except so the API still serves even if operator init fails.
+try:
+    get_operator()
+except Exception as e:
+    log.exception(f"Operator init failed: {e}")
+
+
 if __name__ == "__main__":
-    # For local development only; Render uses gunicorn (see Procfile)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
