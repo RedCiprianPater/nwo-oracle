@@ -349,11 +349,22 @@ def root():
         ],
     })
 
-@app.route("/api/predict", methods=["POST"])
+@app.route("/api/predict", methods=["GET", "POST"])
 def get_prediction():
-    data = request.get_json(silent=True) or {}
+    # Support both POST (JSON body) and GET (query params).
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+    else:
+        data = request.args.to_dict()
     token = (data.get("token") or "ETH").upper()
-    horizon = int(data.get("horizon", 20))
+    # Frontend may pass `timeframe` (minutes); legacy callers pass `horizon` (candles).
+    # Treat 1 minute = 1 candle of horizon (60s OHLCV cadence).
+    if "horizon" in data and data["horizon"] is not None:
+        horizon = int(data["horizon"])
+    elif "timeframe" in data and data["timeframe"] is not None:
+        horizon = int(data["timeframe"])
+    else:
+        horizon = 20
 
     # Use real Coinbase OHLCV when available, otherwise synthetic
     ohlcv = _ohlcv_for(token)
@@ -453,14 +464,25 @@ def get_live_bets():
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
-    return jsonify({
-        "total_volume": 2_100_000,
-        "total_bets": 2_456,
-        "active_bets": 89,
-        "winners_today": 156,
-        "oracle_accuracy": 0.89,
-        "avg_payout": 1.85,
-    })
+    # Pull real numbers from the operator if it's running.
+    # If the operator isn't wired up, return zeros — never fake numbers.
+    stats = {
+        "active_bets": 0,
+        "volume_24h_eth": 0.0,
+        "settled_today": 0,
+        "accuracy": None,
+        "total_bets": 0,
+    }
+    try:
+        if get_operator is not None:
+            op = get_operator()
+            real = getattr(op, "get_stats", None)
+            if callable(real):
+                live = real() or {}
+                stats.update({k: v for k, v in live.items() if k in stats})
+    except Exception:
+        pass
+    return jsonify(stats)
 
 # -- Operator endpoints ------------------------------------------------------
 def _operator_tokens():
