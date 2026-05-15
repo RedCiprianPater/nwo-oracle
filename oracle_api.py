@@ -541,17 +541,64 @@ def get_live_bets():
             if status_int == 0 and amount == 0:
                 continue  # uninitialized slot
 
-            # Map status. The contract's enum 0=Pending in the bet-creator sense
-            # means "still seeking a counterparty" → frontend "open" tab.
-            # Once matched, it's "pending" (awaiting settlement).
-            # Once settled it goes into the "live" tab as a recent settled bet.
-            status_str = STATUS_MAP.get(int(status_int), "open")
-            # Refine: if pending but matched_amount > 0, it's actually matched
-            if status_int == 1:
-                status_str = "pending"
-            # If status_int == 2 (Settled) we surface as "live" (recently active)
-            if status_int == 2:
-                status_str = "live"
+            # Contract enum: Pending(0), Matched(1), Settled(2), Cancelled(3), Expired(4)
+            #
+            # We expose FOUR frontend states (not five) by collapsing the
+            # bookkeeping enum into states a UI can act on:
+            #   - "open"     → status=Pending AND matching window still active.
+            #                  Anyone with another wallet can take the other side.
+            #   - "closed"   → status=Pending BUT matching window expired.
+            #                  No one matched in time; creator can refund.
+            #                  Effectively a "no longer takeable" open bet.
+            #   - "matched"  → status=Matched. Both sides locked. Waiting for
+            #                  settlement time to hit, then operator settles.
+            #   - "settled"  → status=Settled. Resolved with a winner. Show
+            #                  winner address, payouts, end price.
+            #
+            # Cancelled and Expired (refunded) bets are not surfaced; they're
+            # already-money-returned events with no remaining state.
+
+            now = int(time.time())
+            matching_close_at = int(created_at) + 300  # MATCHING_WINDOW = 5 min
+
+            if status_int == 3 or status_int == 4:
+                # Cancelled or expired-and-refunded — don't show, money's back
+                continue
+
+            if status_int == 0:
+                # Still pending — distinguish takeable vs closed
+                status_str = "open" if now < matching_close_at else "closed"
+            elif status_int == 1:
+                status_str = "matched"
+            elif status_int == 2:
+                status_str = "settled"
+            else:
+                status_str = "open"  # fallback
+
+            is_takeable = (status_str == "open")
+            is_refundable = (status_str == "closed")
+
+            # Winner / loser breakdown for settled bets
+            winner_address = None
+            loser_address = None
+            winner_payout_wei = 0
+            loser_refund_wei = 0
+            if status_str == "settled":
+                if creator_won:
+                    winner_address = creator
+                    loser_address = opponent
+                else:
+                    winner_address = opponent
+                    loser_address = creator
+                # Payout math: winner gets stake × multiplier, loser gets tier refund
+                # Multipliers: 5→1.10, 15→1.30, 30→1.60, 60→2.00
+                mult_map = {5: 110, 15: 130, 30: 160, 60: 200}
+                refund_map = {5: 75, 15: 50, 30: 25, 60: 0}
+                m = mult_map.get(int(timeframe), 100)
+                r = refund_map.get(int(timeframe), 0)
+                # Total pot is 2 × amount; winner gets amount × multiplier/100
+                winner_payout_wei = int(amount) * m // 100
+                loser_refund_wei = int(amount) * r // 100
 
             # Fetch the prediction to get the token + start price
             token = "?"
@@ -587,11 +634,20 @@ def get_live_bets():
                 "startPrice": float(start_price) / 1e8 if start_price else None,
                 "createdAt": int(created_at),
                 "expiresAt": int(expires_at),
+                "matchingCloseAt": matching_close_at,
                 "matchedAt": int(matched_at) if matched_at else None,
                 "settlementTime": int(settlement_time) if settlement_time else None,
                 "timeRemaining": max(0, int(settlement_time) - int(time.time())) if settlement_time else None,
                 "status": status_str,
+                # Action hints for the frontend so it doesn't have to re-derive them
+                "isTakeable": is_takeable,
+                "isRefundable": is_refundable,
                 "creatorWon": bool(creator_won),
+                # Settled-bet outcome details
+                "winnerAddress": winner_address,
+                "loserAddress": loser_address,
+                "winnerPayoutWei": str(winner_payout_wei) if winner_payout_wei else None,
+                "loserRefundWei": str(loser_refund_wei) if loser_refund_wei else None,
             })
 
         # Most recent first
